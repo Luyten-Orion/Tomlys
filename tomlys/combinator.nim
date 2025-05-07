@@ -53,8 +53,8 @@ proc failure*[T](state: State, failures: ParseFailures, msg: string): ParseResul
 
 proc forward*[A, B](a: ParseResult[A], _: typedesc[B]): ParseResult[B] =
   assert a.isErr, "Forward can only be called on failures."
-  result = failure[B](a.error.state, a.error.msg)
-  result.incl Forwarded
+  result = failure[B](a.error.state, a.error.kinds + {Forwarded},
+    a.error.msg)
 
 proc run*[T](parser: Parser[T], state: State): ParseResult[T] = parser.fn(state)
 
@@ -78,12 +78,11 @@ proc consume*(): Parser[char] = construct (state: State) => (
 
 # Composition
 proc map*[A, B](a: Parser[A], f: A -> Result[B, (ParseFailures, string)]): Parser[B] = construct (state: State) => (
-  let
-    lastIdx = state.idx
-    res = a.run(state)
+  let startIdx = state.idx
+  var res = a.run(state)
 
   if res.isErr:
-    res.error.state.idx = lastIdx
+    res.error.state.idx = startIdx
     return res.forward(B)
 
   let
@@ -91,7 +90,7 @@ proc map*[A, B](a: Parser[A], f: A -> Result[B, (ParseFailures, string)]): Parse
     mapVal = f(s.value)
 
   if mapVal.isErr:
-    mapVal.error.state.idx = lastIdx
+    res.error.state.idx = startIdx
     var errVal = mapVal.takeErr
     errVal[0].incl MappingFailure
     return failure[B](s.state, errVal[0], errVal[1])
@@ -130,6 +129,63 @@ proc alt*[T](a: Parser[T], b: Parser[T]): Parser[T] = construct (state: State) =
 )
 
 
+proc join*[T: seq](a: Parser[T], b: Parser[T]): Parser[T] = construct (state: State) => (
+  let startIdx = state.idx
+  var res = a.run(state)
+
+  if res.isErr:
+    res.error.state.idx = startIdx
+    return res
+
+  let s = res.take
+  res = b.run(s.state)
+  if res.isErr:
+    res.error.state.idx = startIdx
+    return res
+
+  success[T](s.state, s.value & res.take.value)
+)
+
+
+proc join*[T: not void](a: Parser[T], b: Parser[T]): Parser[seq[T]] = construct (state: State) => (
+  let startIdx = state.idx
+  var
+    values = newSeqOfCap[T](2)
+    res = a.run(state)
+
+  if res.isErr:
+    res.error.state.idx = startIdx
+    return res.forward(seq[T])
+
+  values.add res.unsafeGet.value
+
+  res = b.run(res.unsafeGet.state)
+  if res.isErr:
+    res.error.state.idx = startIdx
+    return res.forward(seq[T])
+
+  values.add res.unsafeGet.value
+  success[seq[T]](res.unsafeGet.state, values)
+)
+
+
+proc join*[T: void](a: Parser[T], b: Parser[T]): Parser[T] = construct (state: State) => (
+  let startIdx = state.idx
+  var res = a.run(state)
+
+  if res.isErr:
+    res.error.state.idx = startIdx
+    return res
+
+  res = b.run(res.take.state)
+  if res.isErr:
+    res.error.state.idx = startIdx
+    return res
+
+  success(res.take.state)
+)
+
+
 proc ignore*[T](p: Parser[T]): Parser[void] = construct (state: State) => (
   let
     start = state.idx
@@ -142,27 +198,32 @@ proc ignore*[T](p: Parser[T]): Parser[void] = construct (state: State) => (
 
 
 proc ignoreLeft*[A, B](a: Parser[A], b: Parser[B]): Parser[B] = construct (state: State) => (
-  let
-    startIdx = state.idx
-    res = a.run(state)
-  if res.isOk: return b.run(res.take.state)
-  res.error.state.idx = startIdx
-  res.forward(B)
+  let startIdx = state.idx
+  var res = a.run(state)
+
+  if res.isErr:
+    res.error.state.idx = startIdx
+    return res.forward(B)
+
+  res = b.run(res.take.state)
+  if res.isErr:
+    res.error.state.idx = startIdx
+    return res
+
+  res
 )
 
 proc ignoreRight*[A, B](a: Parser[A], b: Parser[B]): Parser[A] = construct (state: State) => (
-  var
-    lastIdx = state.idx
-    res = a.run(state)
+  let startIdx = state.idx
+  var res = a.run(state)
 
   if res.isErr:
-    res.error.state.idx = lastIdx
+    res.error.state.idx = startIdx
     return res
 
-  lastIdx = res.unsafeGet.state.idx
   var bRes = b.run(res.take.state)
   if bRes.isErr:
-    bRes.error.state.idx = lastIdx
+    bRes.error.state.idx = startIdx
     return bRes.forward(A)
   res.unsafeGet.state = bRes.take.state
 
@@ -172,7 +233,9 @@ proc ignoreRight*[A, B](a: Parser[A], b: Parser[B]): Parser[A] = construct (stat
 
 proc repeat*[T: not void](p: Parser[T], count = none(int)): Parser[seq[T]] = construct (state: State) => (
   if count.isSome and count.unsafeGet <= 0:
-    return failure[seq[T]](state, MinCountViolation, "Expected at least one value.")
+    return failure[seq[T]](state, {MinCountViolation}, "Expected at least one value.")
+
+  let startIdx = state.idx
 
   var
     lastIdx = state.idx
@@ -181,24 +244,32 @@ proc repeat*[T: not void](p: Parser[T], count = none(int)): Parser[seq[T]] = con
   if count.isSome:
     if res.isErr:
       res.error.state.idx = lastIdx
-      return failure[seq[T]](res.takeErr.state, InsufficientValues, "Expected $1 values but failed to find any." %
+      return failure[seq[T]](res.takeErr.state, {InsufficientValues}, "Expected $1 values but failed to find any." %
         [$count.unsafeGet])
 
     if count.unsafeGet == 1:
+      return success[seq[T]](res.takeErr.state, @[])
+
+  else:
+    if res.isErr:
+      res.error.state.idx = startIdx
       return success[seq[T]](res.takeErr.state, @[])
 
   var values = newSeqOfCap[T](count.get(1))
   values.add res.unsafeGet.value
 
   while res.isOk and (count.isNone or count.unsafeGet > values.len):
-    lastIdx = res.unsafeGet.state.idx
+    if count.isNone: lastIdx = res.unsafeGet.state.idx
     res = p.run(res.unsafeGet.state)
-    if res.isErr: res.error.state.idx = lastIdx
+    if res.isErr:
+      if count.isSome: res.error.state.idx = startIdx
+      else: res.error.state.idx = lastIdx
     if res.isOk: values.add res.unsafeGet.value
     continue
 
   if count.isSome and values.len < count.unsafeGet:
-    return failure[seq[T]](state, InsufficientValues,
+    res.error.state.idx = startIdx
+    return failure[seq[T]](state, {InsufficientValues},
       "Expected $1 values but only found $2." %  [$count.unsafeGet, $values.len])
 
   success[seq[T]](state, values)
