@@ -1,4 +1,5 @@
 import std/[
+  options,
   sugar
 ]
 
@@ -149,7 +150,7 @@ block:
   assert res.error.kinds == {ConditionFailed}
   assert res.error.state.idx == 0
 
-# `join@success`
+# `join(char)@success`
 block:
   let res = accept(c => c == 'a').join(accept(c => c == 'b')).run(State.init("ab"))
   assert res.isOk
@@ -194,3 +195,161 @@ block:
   assert res.unsafeGet.value == 'b'
   assert res.unsafeGet.state.idx == 1
 
+# `map@failure`
+block:
+  let res = accept(c => c == 'a')
+    .map((c: char) => Result[char, (ParseFailures, string)].err(({}, "Failed")))
+    .run(State.init("a"))
+  assert res.isErr
+  assert res.error.kinds == {MappingFailure}
+  assert res.error.state.idx == 0
+
+# `pure@success`
+block:
+  let res = pure('a').run(State.init(""))
+  assert res.isOk
+  assert res.unsafeGet.value == 'a'
+  assert res.unsafeGet.state.idx == 0
+
+# `corrupt@failure`
+block:
+  let res = corrupt(char, "Failed").run(State.init(""))
+  assert res.isErr
+  assert res.error.kinds == {Corruption}
+  assert res.error.state.idx == 0
+
+# `then@success`
+block:
+  let res = accept(c => c == 'a').then(c => pure('b')).run(State.init("a"))
+  assert res.isOk
+  assert res.unsafeGet.value == 'b'
+  assert res.unsafeGet.state.idx == 1
+
+# `then@failure`
+block:
+  let res = accept(c => c == 'a').then(c => char.corrupt("Failed")).run(State.init("a"))
+  assert res.isErr
+  assert res.error.kinds == {Corruption}
+  # Backtracking has to be implemented by the callback
+  assert res.error.state.idx == 1
+
+# `optional[success]@success`
+block:
+  let res = accept(c => c == 'a').optional.run(State.init("a"))
+  assert res.isOk
+  assert res.unsafeGet.value.isSome
+  assert res.unsafeGet.state.idx == 1
+
+# `optional[success]@failure`
+block:
+  let res = accept(c => c == 'a').optional.run(State.init("b"))
+  assert res.isOk
+  assert res.unsafeGet.value.isNone
+  assert res.unsafeGet.state.idx == 0
+
+# `delimited[allowEmpty,trailingDelim=true]@success[empty=false]`
+block:
+  let res = accept(c => c == 'a')
+    .delimited(accept(c => c == 'b').ignore)
+    .run(State.init("ab"))
+  assert res.isOk
+  assert res.unsafeGet.value == @['a']
+  assert res.unsafeGet.state.idx == 2
+
+# `delimited[allowEmpty=true,trailingDelim=true]@success[empty=true]`
+block:
+  let res = accept(c => c == 'a')
+    .delimited(accept(c => c == 'b').ignore)
+    .run(State.init(""))
+  assert res.isOk
+  assert res.unsafeGet.value == @[]
+  assert res.unsafeGet.state.idx == 0
+
+# `delimited[allowEmpty=true,trailingDelim=false]@success`
+block:
+  let res = accept(c => c == 'a')
+    .delimited(accept(c => c == 'b').ignore, true, false)
+    .run(State.init("aba"))
+  assert res.isOk
+  assert res.unsafeGet.value == @['a', 'a']
+  assert res.unsafeGet.state.idx == 3
+
+# `delimited[allowEmpty=false,trailingDelim=true]@success`
+block:
+  let res = accept(c => c == 'a')
+    .delimited(accept(c => c == 'b').ignore, false, true)
+    .run(State.init("ab"))
+  assert res.isOk
+  assert res.unsafeGet.value == @['a']
+  assert res.unsafeGet.state.idx == 2
+
+# `delimited[allowEmpty,trailingDelim=false]@success`
+block:
+  let res = accept(c => c == 'a')
+    .delimited(accept(c => c == 'b').ignore, false, false)
+    .run(State.init("aba"))
+  assert res.isOk
+  assert res.unsafeGet.value == @['a', 'a']
+  assert res.unsafeGet.state.idx == 3
+
+# `delimited[allowEmpty=true,trailingDelim=false]@failure`
+block:
+  let res = accept(c => c == 'a')
+    .delimited(accept(c => c == 'b').ignore, true, false)
+    .run(State.init("ab"))
+  assert res.isErr
+  assert res.error.kinds == {InsufficientValues}
+  assert res.error.state.idx == 0
+
+# `delimited[allowEmpty=false,trailingDelim=true]@failure`
+block:
+  let res = accept(c => c == 'a')
+    .delimited(accept(c => c == 'b').ignore, false, true)
+    .run(State.init(""))
+  assert res.isErr
+  assert res.error.kinds == {ConditionFailed, InsufficientValues, Forwarded}
+  assert res.error.state.idx == 0
+
+# "encase@success"
+block:
+  let res = encase(
+    accept(c => c == 'a'),
+    accept(c => c == '(').ignore,
+    accept(c => c == ')').ignore
+  ).run(State.init("(a)"))
+  assert res.isOk
+  assert res.unsafeGet.value == 'a'
+  assert res.unsafeGet.state.idx == 3
+
+# "encase@failure[side=left]"
+block:
+  let res = encase(
+    accept(c => c == 'a'),
+    accept(c => c == '[').ignore,
+    accept(c => c == ')').ignore
+  ).run(State.init("(a)"))
+  assert res.isErr
+  assert res.error.kinds == {ConditionFailed, Forwarded}
+  assert res.error.state.idx == 0
+
+# "encase@failure[side=center]"
+block:
+  let res = encase(
+    accept(c => c == 'x'),
+    accept(c => c == '(').ignore,
+    accept(c => c == ')').ignore
+  ).run(State.init("(a)"))
+  assert res.isErr
+  assert res.error.kinds == {ConditionFailed}
+  assert res.error.state.idx == 0
+
+# "encase@failure[side=right]"
+block:
+  let res = encase(
+    accept(c => c == 'a'),
+    accept(c => c == '(').ignore,
+    accept(c => c == ']').ignore
+  ).run(State.init("(a)"))
+  assert res.isErr
+  assert res.error.kinds == {ConditionFailed, Forwarded}
+  assert res.error.state.idx == 0

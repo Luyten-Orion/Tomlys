@@ -68,7 +68,9 @@ proc `init`*(_: typedesc[State], src: string, name = "<string>"): State = State(
 proc pure*[T: not void](value: T): Parser[T] = result.fn = (state: State) => success(state, value)
 proc pure*(): Parser[void] = result.fn = (state: State) => success(state)
 
-proc corrupt*[T](typ: typedesc[T], msg: string): Parser[T] = result.fn = (state: State) => failure[T](state, msg)
+proc corrupt*[T](typ: typedesc[T], msg: string): Parser[T] = result.fn = (state: State) => (
+  failure[T](state, {Corruption}, msg)
+)
 
 # Conditional parsers
 proc consume*(): Parser[char] = construct (state: State) => (
@@ -90,20 +92,21 @@ proc map*[A, B](a: Parser[A], f: A -> Result[B, (ParseFailures, string)]): Parse
     mapVal = f(s.value)
 
   if mapVal.isErr:
-    res.error.state.idx = startIdx
-    var errVal = mapVal.takeErr
-    errVal[0].incl MappingFailure
-    return failure[B](s.state, errVal[0], errVal[1])
+    res.unsafeGet.state.idx = startIdx
+    var
+      errVal = mapVal.takeErr
+      errKinds = errVal[0] + {MappingFailure}
+    return failure[B](s.state, errKinds, errVal[1])
   success[B](s.state, mapVal.take)
 )
 
 
 proc then*[A, B](a: Parser[A], f: A -> Parser[B]): Parser[B] = construct (state: State) => (
-  var
-    lastIdx = state.idx
-    res = a(state)
+  let startIdx = state.idx
+  var res = a(state)
 
   if res.isErr:
+    res.error.state.idx = startIdx
     return res.forward(B)
 
   let s = res.take
@@ -197,43 +200,53 @@ proc ignore*[T](p: Parser[T]): Parser[void] = construct (state: State) => (
 )
 
 
-proc ignoreLeft*[A, B](a: Parser[A], b: Parser[B]): Parser[B] = construct (state: State) => (
-  let startIdx = state.idx
-  var res = a.run(state)
+proc ignoreLeft*[A, B](
+  a: Parser[A],
+  b: Parser[B]
+): Parser[B] =
+  construct (state: State) => (
+    let startIdx = state.idx
+    var res = a.run(state)
 
-  if res.isErr:
-    res.error.state.idx = startIdx
-    return res.forward(B)
+    if res.isErr:
+      res.error.state.idx = startIdx
+      return res.forward(B)
 
-  res = b.run(res.take.state)
-  if res.isErr:
-    res.error.state.idx = startIdx
-    return res
+    res = b.run(res.take.state)
+    if res.isErr:
+      res.error.state.idx = startIdx
+      return res
 
-  res
-)
+    res
+  )
 
-proc ignoreRight*[A, B](a: Parser[A], b: Parser[B]): Parser[A] = construct (state: State) => (
-  let startIdx = state.idx
-  var res = a.run(state)
+proc ignoreRight*[A, B](
+  a: Parser[A],
+  b: Parser[B]
+): Parser[A] =
+  construct (state: State) => (
+    let startIdx = state.idx
+    var res = a.run(state)
 
-  if res.isErr:
-    res.error.state.idx = startIdx
-    return res
+    if res.isErr:
+      res.error.state.idx = startIdx
+      return res
 
-  var bRes = b.run(res.take.state)
-  if bRes.isErr:
-    bRes.error.state.idx = startIdx
-    return bRes.forward(A)
-  res.unsafeGet.state = bRes.take.state
+    var bRes = b.run(res.take.state)
+    if bRes.isErr:
+      bRes.error.state.idx = startIdx
+      return bRes.forward(A)
+    res.unsafeGet.state = bRes.take.state
 
-  success[A](res.unsafeGet.state, res.unsafeGet.value)
-)
+    success[A](res.unsafeGet.state, res.unsafeGet.value)
+  )
 
 
 proc repeat*[T: not void](p: Parser[T], count = none(int)): Parser[seq[T]] = construct (state: State) => (
   if count.isSome and count.unsafeGet <= 0:
-    return failure[seq[T]](state, {MinCountViolation}, "Expected at least one value.")
+    return failure[seq[T]](
+      state, {MinCountViolation}, "Expected at least one value."
+    )
 
   let startIdx = state.idx
 
@@ -244,8 +257,10 @@ proc repeat*[T: not void](p: Parser[T], count = none(int)): Parser[seq[T]] = con
   if count.isSome:
     if res.isErr:
       res.error.state.idx = lastIdx
-      return failure[seq[T]](res.takeErr.state, {InsufficientValues}, "Expected $1 values but failed to find any." %
-        [$count.unsafeGet])
+      return failure[seq[T]](
+        res.takeErr.state, {InsufficientValues},
+        "Expected $1 values but failed to find any." % [$count.unsafeGet]
+      )
 
     if count.unsafeGet == 1:
       return success[seq[T]](res.takeErr.state, @[])
@@ -269,88 +284,133 @@ proc repeat*[T: not void](p: Parser[T], count = none(int)): Parser[seq[T]] = con
 
   if count.isSome and values.len < count.unsafeGet:
     res.error.state.idx = startIdx
-    return failure[seq[T]](state, {InsufficientValues},
-      "Expected $1 values but only found $2." %  [$count.unsafeGet, $values.len])
+    return failure[seq[T]](
+      state, {InsufficientValues},
+      "Expected $1 values but only found $2." %
+        [$count.unsafeGet, $values.len]
+    )
 
   success[seq[T]](state, values)
 )
 
-proc repeat*(p: Parser[void], count = none(int)): Parser[void] = construct (state: State) => (
-  if count.isSome and count.unsafeGet <= 0:
-    return failure[void](state, {MinCountViolation}, "Expected at least one value.")
-
-  var
-    lastIdx = state.idx
-    counter = 1
-    res = p.run(state)
-
-  if count.isSome:
-    if res.isErr:
-      res.error.state.idx = lastIdx
-      return failure[void](res.takeErr.state, {InsufficientValues}, "Expected $1 values but failed to find any." %
-        [$count.unsafeGet])
-
-    if count.unsafeGet == 1:
-      return success(res.takeErr.state)
-
-  while res.isOk and (count.isNone or counter < count.unsafeGet):
-    lastIdx = res.unsafeGet.state.idx
-    res = p.run(res.unsafeGet.state)
-    if res.isErr: res.error.state.idx = lastIdx
-    continue
-
-  if count.isSome and counter < count.unsafeGet:
-    return failure[void](state, {InsufficientValues}, "Expected $1 values but only found $2." % 
-      [$count.unsafeGet, $counter])
-
-  success(state)
-)
-
-proc repeat*[T: not void](p: Parser[T], count: int): Parser[seq[T]] {.inline.} = p.repeat(some(count))
-proc repeat*[T: void](p: Parser[T], count: int): Parser[T] {.inline.} = p.repeat(some(count))
-
-
-proc accept*(cond: char -> bool): Parser[char] = construct (state: State) => (
-  if state.idx < state.src.len and cond(state.src[state.idx]):
-    inc state.idx
-    return success(state, state.src[state.idx - 1])
-  failure[char](state, {ConditionFailed}, "Failed to satisfy condition.")
-)
-
-
-proc optional*[T](p: Parser[T]): Parser[Option[T]] = construct (state: State) => (
-  let res = p.run(state)
-  if res.isOk: return success[Option[T]](res.unsafeGet.state, some(res.unsafeGet.value))
-  success[Option[T]](state, none[T]())
-)
-
-
-proc delimited*[T: not void](p: Parser[T], delimiter: Parser[void], allowEmpty = true): Parser[seq[T]] =
+proc repeat*(
+  p: Parser[void],
+  count = none(int)
+): Parser[void] =
   construct (state: State) => (
+    if count.isSome and count.unsafeGet <= 0:
+      return failure[void](
+        state, {MinCountViolation}, "Expected at least one value."
+      )
+
+    var
+      lastIdx = state.idx
+      counter = 1
+      res = p.run(state)
+
+    if count.isSome:
+      if res.isErr:
+        res.error.state.idx = lastIdx
+        return failure[void](
+          res.takeErr.state, {InsufficientValues},
+          "Expected $1 values but failed to find any." % [$count.unsafeGet]
+        )
+
+      if count.unsafeGet == 1:
+        return success(res.takeErr.state)
+
+    while res.isOk and (count.isNone or counter < count.unsafeGet):
+      lastIdx = res.unsafeGet.state.idx
+      res = p.run(res.unsafeGet.state)
+      if res.isErr: res.error.state.idx = lastIdx
+      continue
+
+    if count.isSome and counter < count.unsafeGet:
+      return failure[void](
+          state, {InsufficientValues},
+          "Expected $1 values but only found $2." %
+            [$count.unsafeGet, $counter]
+        )
+
+    success(state)
+  )
+
+proc repeat*[T: not void](
+  p: Parser[T],
+  count: int
+): Parser[seq[T]] {.inline.} = p.repeat(some(count))
+
+proc repeat*[T: void](
+  p: Parser[T],
+  count: int
+): Parser[T] {.inline.} = p.repeat(some(count))
+
+
+proc accept*(cond: char -> bool): Parser[char] =
+  construct (state: State) => (
+    if state.idx < state.src.len and cond(state.src[state.idx]):
+      inc state.idx
+      return success(state, state.src[state.idx - 1])
+    failure[char](state, {ConditionFailed}, "Failed to satisfy condition.")
+  )
+
+
+proc optional*[T](p: Parser[T]): Parser[Option[T]] =
+  construct (state: State) => (
+    let res = p.run(state)
+    if res.isOk: return success[Option[T]](
+        res.unsafeGet.state, some(res.unsafeGet.value)
+      )
+    success[Option[T]](state, none[T]())
+  )
+
+
+proc delimited*[T: not void](
+  p: Parser[T],
+  delimiter: Parser[void],
+  allowEmpty, trailingDelim = true
+): Parser[seq[T]] =
+  construct (state: State) => (
+    let startIdx = state.idx
     var
       lastIdx = state.idx
       res = p.run(state)
+      isOk = false
 
     if res.isErr:
       res.error.state.idx = lastIdx
       if allowEmpty:
         return success[seq[T]](res.takeErr.state, @[])
-      return res.forward(seq[T])
+      let err = res
+      return failure[T](
+        res.error.state, res.error.kinds + InsufficientValues,
+        res.error.msg
+      ).forward(seq[T])
+
+    isOk = true
 
     var values = newSeqOfCap[T](1)
     values.add res.unsafeGet.value
 
-    while res.isOk:
+    while isOk:
       lastIdx = res.unsafeGet.state.idx
-      res = delimiter.run(res.unsafeGet.state)
-      if res.isErr:
-        res.error.state.idx = lastIdx
+      let delimRes = delimiter.run(res.unsafeGet.state)
+      isOk = delimRes.isOk
+      if delimRes.isErr:
+        delimRes.error.state.idx = lastIdx
         continue
 
-      lastIdx = res.unsafeGet.state.idx
-      res = p.run(res.unsafeGet.state)
+      lastIdx = delimRes.unsafeGet.state.idx
+      res = p.run(delimRes.unsafeGet.state)
+      isOk = res.isOk
       if res.isErr:
-        res.error.state.idx = lastIdx
+        if trailingDelim: res.error.state.idx = lastIdx
+        else:
+          res.error.state.idx = startIdx
+          return failure[seq[T]](
+            res.takeErr.state, {InsufficientValues},
+            "Expected value after delimiter."
+          )
         continue
 
       values.add res.unsafeGet.value
@@ -359,8 +419,13 @@ proc delimited*[T: not void](p: Parser[T], delimiter: Parser[void], allowEmpty =
   )
 
 
-proc delimited*[T: void](p: Parser[void], delimiter: Parser[void], allowEmpty, trailingDelim = true): Parser[void] =
+proc delimited*[T: void](
+  p: Parser[void],
+  delimiter: Parser[void],
+  allowEmpty, trailingDelim = true
+): Parser[void] =
   construct (state: State) => (
+    let startIdx = state.idx
     var
       lastIdx = state.idx
       res = p.run(state)
@@ -369,7 +434,9 @@ proc delimited*[T: void](p: Parser[void], delimiter: Parser[void], allowEmpty, t
       res.error.state.idx = lastIdx
       if allowEmpty:
         return success(res.takeErr.state)
-      return res
+      var err = res.forward(seq[T])
+      err.error.kinds.incl(InsufficientValues)
+      return err
 
     while res.isOk:
       lastIdx = res.unsafeGet.state.idx
@@ -381,9 +448,13 @@ proc delimited*[T: void](p: Parser[void], delimiter: Parser[void], allowEmpty, t
       lastIdx = res.unsafeGet.state.idx
       res = p.run(res.unsafeGet.state)
       if res.isErr:
-        res.error.state.idx = lastIdx
-        if not trailingDelim:
-          return failure[void](res.takeErr.state, "Expected delimiter.")
+        if trailingDelim: res.error.state.idx = lastIdx
+        else:
+          res.error.state.idx = startIdx
+          return failure[void](
+            res.takeErr.state, {InsufficientValues},
+            "Expected value after delimiter."
+          )
         continue
 
     success(state)
@@ -398,20 +469,21 @@ proc encase*[T](p: Parser[T], left, right: Parser[void]): Parser[T] = construct 
     res.error.state.idx = startIdx
     return res.forward(T)
 
-  res = p.run(res.unsafeGet.state)
-  if res.isErr:
-    res.error.state.idx = startIdx
-    return res
+  result = p.run(res.unsafeGet.state)
+  if result.isErr:
+    result.error.state.idx = startIdx
+    return
 
   when T isnot void:
-    let value = res.unsafeGet.value
+    let value = result.unsafeGet.value
 
-  res = right.run(res.unsafeGet.state)
+  res = right.run(result.unsafeGet.state)
   if res.isErr:
     res.error.state.idx = startIdx
     return res.forward(T)
 
   when T isnot void:
     return success(res.unsafeGet.state, value)
-  success(res.unsafeGet.state)
+  else:
+    return success(res.unsafeGet.state)
 )
